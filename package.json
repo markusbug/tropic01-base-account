@@ -1,0 +1,33 @@
+{
+  "name": "cbsw-p256-libtropic-example",
+  "version": "0.1.0",
+  "description": "Coinbase Smart Wallet + P-256 hardware signer (Tropic Square) example",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node ./cbsw_p256_webauthn.js"
+  },
+  "dependencies": {
+    "viem": "^2.38.6"
+  }
+}
+
+{
+  "name": "test_p256",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "viem": "^2.38.6"
+  }
+}

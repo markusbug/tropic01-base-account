@@ -1,0 +1,22 @@
+# Node
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn.lock
+
+# Local env & logs
+.env
+*.log
+
+# Build artifacts
+libtropic-util/build/
+*.bin
+*.o
+*.a
+*.so
+.DS_Store
+
+# Generated files
+userop.json
+
+
