@@ -6,7 +6,7 @@ This repo demonstrates signing Coinbase Smart Wallet (ERC-4337) UserOperations u
 - Signature wrapper encoding matches common on-chain verifiers (SignatureWrapper = `(uint256 ownerIndex, bytes signatureData)`; `signatureData = abi.encode(WebAuthnAuth)`).
 
 ## Repo layout
-- `cbsw_p256_webauthn.js` — Build, sign (manual or auto), and optionally submit a UserOp
+- `cbsw_p256_webauthn.js` — Derives owner pubkey from hardware, predicts wallet address via factory, builds & signs (manual or auto), and optionally submits a UserOp
 - `libtropic-util/` — Submodule with Tropic Square `libtropic-util` (contains its own submodules). Build outputs expected at `libtropic-util/build/lt-util`.
 
 ## Prerequisites
@@ -51,6 +51,22 @@ Export Owner[0] pubkey X||Y:
 echo 0x$(xxd -p -c 1000 pubkey_slot1.bin)
 ```
 Use this `0x{X}{Y}` when configuring/deploying your Coinbase Smart Wallet owner.
+
+## Configure
+Required env (chain-specific where applicable):
+```
+# Coinbase Smart Wallet Factory (chain-specific; default is example address used in samples)
+export FACTORY_ADDRESS=0x0BA5ED0c6AA8c49038F819E587E2633c4A9F428a
+
+# Optional: recovery owner as EOA address (will be ABI-encoded as 32 bytes)
+# export OWNER_RECOVERY_ADDRESS=0xYourRecoveryEoa
+
+# Optional: deployment nonce for getAddress (default 0)
+# export OWNER_NONCE=0
+
+# Bundler URL if you want to send
+# export BUNDLER_URL=...
+```
 
 ## Run (manual sign)
 ```

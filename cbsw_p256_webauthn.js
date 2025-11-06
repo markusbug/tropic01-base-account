@@ -1,13 +1,14 @@
 // file: prepare-sign-and-build-userop.mjs
 // node >=18, ESM
-import { createPublicClient, encodeAbiParameters, encodeFunctionData, decodeAbiParameters, http, keccak256, toHex } from 'viem';
+import { createPublicClient, createWalletClient, encodeAbiParameters, encodeFunctionData, decodeAbiParameters, http, keccak256, toHex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { baseSepolia } from 'viem/chains';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,10 +27,14 @@ const WEBAUTHN_AUTHDATA_SIGNCOUNT = false;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LTUTIL_BIN = process.env.LTUTIL_BIN || join(__dirname, 'libtropic-util', 'build', 'lt-util');
 const LTUTIL_DEVICE = process.env.LTUTIL_DEVICE || '/dev/ttyACM0';
-const LTUTIL_SLOT = process.env.LTUTIL_SLOT || '1';
+let LTUTIL_SLOT = process.env.LTUTIL_SLOT || '1';
 const LTUTIL_USE_SUDO = (process.env.LTUTIL_USE_SUDO || '0') === '1';
 const AUTO_SEND = (process.env.SEND || process.env.AUTO_SEND || '0') === '1';
 const USEROP_OUT = process.env.USEROP_OUT || '';
+// Smart Wallet factory config
+const FACTORY_ADDRESS = (process.env.FACTORY_ADDRESS || '');
+const OWNER_NONCE = BigInt(process.env.OWNER_NONCE || '0');
+const OWNER_RECOVERY_ADDRESS = process.env.OWNER_RECOVERY_ADDRESS || '';
 
 function execFilePromise(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -44,6 +49,7 @@ function execFilePromise(cmd, args) {
 }
 
 async function autoSignWithLtUtil(messageHashHex) {
+  ensureLtUtilExists();
   const tmp = mkdtempSync(join(tmpdir(), 'lt-sign-'));
   const out = join(tmp, 'sig_rs.bin');
   const args = [LTUTIL_DEVICE, '-e', '-S', String(LTUTIL_SLOT), messageHashHex, out];
@@ -58,6 +64,62 @@ async function autoSignWithLtUtil(messageHashHex) {
     return hex;
   } catch (e) {
     throw new Error(`lt-util signing failed: ${e.message}`);
+  }
+}
+
+async function autoFetchPubkeyXY() {
+  ensureLtUtilExists();
+  // If provided via env, trust it
+  if (process.env.PUBKEY_XY && /^0x[0-9a-fA-F]{128}$/.test(process.env.PUBKEY_XY)) {
+    return process.env.PUBKEY_XY;
+  }
+  const tmp = mkdtempSync(join(tmpdir(), 'lt-pub-'));
+  const out = join(tmp, 'pubkey_slot.bin');
+  const args = [LTUTIL_DEVICE, '-e', '-d', String(LTUTIL_SLOT), out];
+  try {
+    if (LTUTIL_USE_SUDO) {
+      await execFilePromise('/usr/bin/sudo', [LTUTIL_BIN, ...args]);
+    } else {
+      await execFilePromise(LTUTIL_BIN, args);
+    }
+    const pub = readFileSync(out);
+    if (pub.length !== 64) throw new Error(`Expected 64-byte XY, got ${pub.length}`);
+    return '0x' + Buffer.from(pub).toString('hex');
+  } catch (e) {
+    throw new Error(`lt-util pubkey read failed: ${e.message}`);
+  }
+}
+
+function encodeAddressAsAbi(addressHex) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(addressHex)) throw new Error('Bad recovery address');
+  const buf = Buffer.alloc(32, 0x00);
+  Buffer.from(addressHex.slice(2), 'hex').copy(buf, 12);
+  return '0x' + buf.toString('hex');
+}
+
+function ensureLtUtilExists() {
+  if (existsSync(LTUTIL_BIN)) return;
+  const msg = [
+    `lt-util binary not found at: ${LTUTIL_BIN}`,
+    'Build instructions:',
+    '  git submodule update --init --recursive',
+    '  cd libtropic-util',
+    '  mkdir -p build && cd build',
+    '  cmake .. -DUSB_DONGLE_TS1302=1   # or TS1301 / -DLINUX_SPI=1',
+    '  make -j',
+  ].join('\n');
+  throw new Error(msg);
+}
+
+function ensureFactoryAddress() {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(FACTORY_ADDRESS)) {
+    const msg = [
+      'FACTORY_ADDRESS is not set or invalid.',
+      'Set FACTORY_ADDRESS to the Coinbase Smart Wallet factory for your network, e.g.:',
+      '  export FACTORY_ADDRESS=0x<factory_on_your_chain>',
+      'Then re-run the script.'
+    ].join('\n');
+    throw new Error(msg);
   }
 }
 
@@ -109,6 +171,50 @@ const cbswAbi = [
       { name: 'data', type: 'bytes' },
     ],
     outputs: []
+  },
+];
+
+// Factory ABI (getAddress)
+const cbswFactoryAbi = [
+  {
+    type: 'function',
+    name: 'getAddress',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owners', type: 'bytes[]' },
+      { name: 'nonce', type: 'uint256' },
+    ],
+    outputs: [ { name: 'account', type: 'address' } ],
+  },
+];
+
+// EntryPoint v0.6 write ABI (handleOps)
+const entryPointWriteAbi = [
+  {
+    type: 'function',
+    name: 'handleOps',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'ops',
+        type: 'tuple[]',
+        components: [
+          { name: 'sender', type: 'address' },
+          { name: 'nonce', type: 'uint256' },
+          { name: 'initCode', type: 'bytes' },
+          { name: 'callData', type: 'bytes' },
+          { name: 'callGasLimit', type: 'uint256' },
+          { name: 'verificationGasLimit', type: 'uint256' },
+          { name: 'preVerificationGas', type: 'uint256' },
+          { name: 'maxFeePerGas', type: 'uint256' },
+          { name: 'maxPriorityFeePerGas', type: 'uint256' },
+          { name: 'paymasterAndData', type: 'bytes' },
+          { name: 'signature', type: 'bytes' },
+        ],
+      },
+      { name: 'beneficiary', type: 'address' },
+    ],
+    outputs: [],
   },
 ];
 
@@ -170,11 +276,37 @@ async function rpc(url, method, params) {
 (async () => {
   const rl = readline.createInterface({ input, output });
 
-  const sender = (await rl.question('Coinbase Smart Wallet address (sender): ')).trim();
-  const pubXY = (await rl.question('Owner[0] P-256 pubkey (X||Y, 130 chars incl 0x): ')).trim();
-  if (!/^0x[0-9a-fA-F]{128}$/.test(pubXY)) throw new Error('Bad pubkey format, expected 0x + 128 hex chars.');
+  // Ask for Tropic Square P-256 key slot
+  const slotAns = (await rl.question(`Tropic Square P-256 key slot (0-31) [${LTUTIL_SLOT}]: `)).trim();
+  if (slotAns.length > 0) {
+    const n = Number(slotAns);
+    if (!Number.isInteger(n) || n < 0 || n > 31) {
+      throw new Error('Invalid key slot, expected integer 0-31');
+    }
+    LTUTIL_SLOT = String(n);
+  }
+  console.log('Using key slot:', LTUTIL_SLOT);
+
+  // Fetch Owner[0] pubkey (X||Y) from hardware
+  const pubXY = await autoFetchPubkeyXY();
+  console.log('Owner[0] P-256 pubkey (X||Y):', pubXY);
 
   const client = createPublicClient({ chain: CHAIN, transport: http(RPC_URL) });
+
+  // Compute predicted sender via factory.getAddress(bytes[] owners, uint256 nonce)
+  const owners = [pubXY];
+  if (OWNER_RECOVERY_ADDRESS) owners.push(encodeAddressAsAbi(OWNER_RECOVERY_ADDRESS));
+  ensureFactoryAddress();
+  // Debug info for owners encoding
+  console.log('Factory:', FACTORY_ADDRESS, 'owners count:', owners.length, 'nonce:', OWNER_NONCE.toString());
+  owners.forEach((o, i) => console.log(`owners[${i}] len=${(o.length-2)/2}B`));
+  const sender = await client.readContract({
+    address: FACTORY_ADDRESS,
+    abi: cbswFactoryAbi,
+    functionName: 'getAddress',
+    args: [owners, OWNER_NONCE],
+  });
+  console.log('Predicted Smart Wallet address (sender):', sender);
 
   // Build minimal callData: execute(self, 0, 0x) – a no-op call that succeeds. (ABI: 0xb61d27f6)  :contentReference[oaicite:1]{index=1}
   const callData = encodeFunctionData({
@@ -270,19 +402,15 @@ async function rpc(url, method, params) {
   console.log(messageHash);
   console.log('(Accepts signature as 0x{r}{s} or DER)\n');
 
+  // Always auto-sign with lt-util (no interactive paste)
   let sigHex;
-  // Try hardware signer if configured
-  if (process.env.LTUTIL_AUTOSIGN === '1') {
-    try {
-      console.log('Attempting lt-util auto-sign...');
-      sigHex = await autoSignWithLtUtil(messageHash);
-      console.log('lt-util signature:', sigHex);
-    } catch (e) {
-      console.log('Auto-sign failed, falling back to manual paste:', e.message);
-      sigHex = (await rl.question('Paste signature: ')).trim();
-    }
-  } else {
-    sigHex = (await rl.question('Paste signature: ')).trim();
+  try {
+    console.log('Attempting lt-util auto-sign...');
+    sigHex = await autoSignWithLtUtil(messageHash);
+    console.log('lt-util signature:', sigHex);
+  } catch (e) {
+    throw new Error(`Auto-sign failed: ${e.message}\n` +
+      'Check lt-util build/permissions and environment (LTUTIL_DEVICE, LTUTIL_SLOT, LTUTIL_USE_SUDO).');
   }
   let rHex, sHex;
   if (/^0x[0-9a-fA-F]+$/.test(sigHex)) {
@@ -367,28 +495,34 @@ async function rpc(url, method, params) {
 
   userOp = { ...userOp, signature: signatureWrapper };
 
-  console.log('\n=== Final UserOperation (ready to send) ===');
-  console.log(JSON.stringify(userOp, (k, v) => (typeof v === 'bigint' ? '0x' + v.toString(16) : v), 2));
+  // Ask if user wants to submit directly to EntryPoint with an EOA private key
+  const doPkSubmit = (await rl.question('\nSubmit directly to EntryPoint with an EOA private key now? [y/N]: '))
+    .trim().toLowerCase() === 'y';
 
-  // Optionally write to file
-  if (USEROP_OUT) {
-    try {
-      writeFileSync(USEROP_OUT, JSON.stringify(userOp, (k, v) => (typeof v === 'bigint' ? '0x' + v.toString(16) : v), 2));
-      console.log(`Wrote UserOperation to ${USEROP_OUT}`);
-    } catch (e) {
-      console.log(`Failed writing ${USEROP_OUT}:`, e.message);
-    }
-  }
-
-  if (BUNDLER_URL) {
-    let send = AUTO_SEND;
-    if (!send) {
-      send = (await rl.question('\nSend to bundler now? [y/N]: ')).trim().toLowerCase() === 'y';
-    }
-    if (send) {
-      // If you didn’t estimate before, you should call eth_estimateUserOperationGas here.
-      const hash = await rpc(BUNDLER_URL, 'eth_sendUserOperation', [userOp, ENTRY_POINT]);
-      console.log('Bundler accepted. userOpHash:', hash);
+  if (doPkSubmit) {
+    const pkIn = (await rl.question('Private key (0x...): ')).trim();
+    const pk = pkIn.startsWith('0x') ? pkIn : ('0x' + pkIn);
+    if (!/^0x[0-9a-fA-F]{64}$/.test(pk)) throw new Error('Invalid private key format. Expected 32-byte hex.');
+    const account = privateKeyToAccount(pk);
+    const beneficiary = account.address;
+    const walletClient = createWalletClient({ account, chain: CHAIN, transport: http(RPC_URL) });
+    const txHash = await walletClient.writeContract({
+      address: ENTRY_POINT,
+      abi: entryPointWriteAbi,
+      functionName: 'handleOps',
+      args: [[userOp], beneficiary],
+    });
+    console.log('Sent handleOps tx:', txHash);
+  } else {
+    console.log('\n=== Final UserOperation (ready to send) ===');
+    console.log(JSON.stringify(userOp, (k, v) => (typeof v === 'bigint' ? '0x' + v.toString(16) : v), 2));
+    if (USEROP_OUT) {
+      try {
+        writeFileSync(USEROP_OUT, JSON.stringify(userOp, (k, v) => (typeof v === 'bigint' ? '0x' + v.toString(16) : v), 2));
+        console.log(`Wrote UserOperation to ${USEROP_OUT}`);
+      } catch (e) {
+        console.log(`Failed writing ${USEROP_OUT}:`, e.message);
+      }
     }
   }
 
