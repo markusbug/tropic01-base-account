@@ -111,6 +111,22 @@ function ensureLtUtilExists() {
   throw new Error(msg);
 }
 
+async function generateP256KeyInSlot(slotStr) {
+  ensureLtUtilExists();
+  const args = [LTUTIL_DEVICE, '-e', '-g', String(slotStr), 'p256'];
+  try {
+    console.log(`Generating P-256 key in slot ${slotStr}...`);
+    if (LTUTIL_USE_SUDO) {
+      await execFilePromise('/usr/bin/sudo', [LTUTIL_BIN, ...args]);
+    } else {
+      await execFilePromise(LTUTIL_BIN, args);
+    }
+    console.log('Key generation OK.');
+  } catch (e) {
+    throw new Error(`lt-util key generate failed: ${e.message}`);
+  }
+}
+
 function ensureFactoryAddress() {
   if (!/^0x[0-9a-fA-F]{40}$/.test(FACTORY_ADDRESS)) {
     const msg = [
@@ -180,6 +196,16 @@ const cbswFactoryAbi = [
     type: 'function',
     name: 'getAddress',
     stateMutability: 'view',
+    inputs: [
+      { name: 'owners', type: 'bytes[]' },
+      { name: 'nonce', type: 'uint256' },
+    ],
+    outputs: [ { name: 'account', type: 'address' } ],
+  },
+  {
+    type: 'function',
+    name: 'createAccount',
+    stateMutability: 'nonpayable',
     inputs: [
       { name: 'owners', type: 'bytes[]' },
       { name: 'nonce', type: 'uint256' },
@@ -287,14 +313,31 @@ async function rpc(url, method, params) {
   }
   console.log('Using key slot:', LTUTIL_SLOT);
 
-  // Fetch Owner[0] pubkey (X||Y) from hardware
-  const pubXY = await autoFetchPubkeyXY();
+  // Fetch Owner[0] pubkey (X||Y) from hardware; if empty slot, offer to generate
+  let pubXY;
+  try {
+    pubXY = await autoFetchPubkeyXY();
+  } catch (e) {
+    console.log('Could not read P-256 public key from slot', LTUTIL_SLOT);
+    console.log(e.message);
+    const gen = (await rl.question(`Generate new P-256 key in slot ${LTUTIL_SLOT}? [y/N]: `)).trim().toLowerCase() === 'y';
+    if (!gen) throw e;
+    await generateP256KeyInSlot(LTUTIL_SLOT);
+    pubXY = await autoFetchPubkeyXY();
+  }
   console.log('Owner[0] P-256 pubkey (X||Y):', pubXY);
 
   const client = createPublicClient({ chain: CHAIN, transport: http(RPC_URL) });
 
   // Compute predicted sender via factory.getAddress(bytes[] owners, uint256 nonce)
-  const owners = [pubXY];
+  // Owner[0] as abi.encode((uint256 x, uint256 y)) exactly like Android reference
+  const xHex = '0x' + pubXY.slice(2, 66);
+  const yHex = '0x' + pubXY.slice(66);
+  const firstOwnerEncoded = encodeAbiParameters(
+    [ { type: 'tuple', components: [ { type: 'uint256' }, { type: 'uint256' } ] } ],
+    [ [ BigInt(xHex), BigInt(yHex) ] ]
+  );
+  const owners = [firstOwnerEncoded];
   if (OWNER_RECOVERY_ADDRESS) owners.push(encodeAddressAsAbi(OWNER_RECOVERY_ADDRESS));
   ensureFactoryAddress();
   // Debug info for owners encoding
@@ -315,6 +358,26 @@ async function rpc(url, method, params) {
     args: [sender, 0n, '0x'],
   });
 
+  // If account not deployed, fill initCode = factory + abi.encodeCall(createAccount(owners, nonce))
+  let initCode = '0x';
+  try {
+    const code = await client.getBytecode({ address: sender });
+    const deployed = code && code !== '0x';
+    if (!deployed) {
+      const factoryCalldata = encodeFunctionData({
+        abi: cbswFactoryAbi,
+        functionName: 'createAccount',
+        args: [owners, OWNER_NONCE],
+      });
+      initCode = FACTORY_ADDRESS + factoryCalldata.slice(2);
+      console.log('Account not deployed. Populating initCode.');
+    } else {
+      console.log('Account is already deployed. initCode left empty.');
+    }
+  } catch (e) {
+    console.log('Bytecode check failed; leaving initCode empty:', e.message);
+  }
+
   // Nonce from EntryPoint v0.6: getNonce(sender, key=0)
   const nonce = await client.readContract({
     address: ENTRY_POINT,
@@ -327,7 +390,7 @@ async function rpc(url, method, params) {
   let userOp = {
     sender,
     nonce,
-    initCode: '0x',
+    initCode,
     callData,
     callGasLimit: 100000n,
     verificationGasLimit: 350000n, // WebAuthn verify cost; adjust if needed
@@ -506,13 +569,32 @@ async function rpc(url, method, params) {
     const account = privateKeyToAccount(pk);
     const beneficiary = account.address;
     const walletClient = createWalletClient({ account, chain: CHAIN, transport: http(RPC_URL) });
-    const txHash = await walletClient.writeContract({
-      address: ENTRY_POINT,
-      abi: entryPointWriteAbi,
-      functionName: 'handleOps',
-      args: [[userOp], beneficiary],
-    });
-    console.log('Sent handleOps tx:', txHash);
+    let txHash;
+    try {
+      txHash = await walletClient.writeContract({
+        address: ENTRY_POINT,
+        abi: entryPointWriteAbi,
+        functionName: 'handleOps',
+        args: [[userOp], beneficiary],
+      });
+      console.log('Sent handleOps tx (via writeContract):', txHash);
+    } catch (e) {
+      console.log('writeContract failed (likely due to simulation). Sending raw tx with fallback gas...');
+      const data = encodeFunctionData({
+        abi: entryPointWriteAbi,
+        functionName: 'handleOps',
+        args: [[userOp], beneficiary],
+      });
+      const fallbackGas = BigInt(process.env.FALLBACK_GAS || '2000000');
+      txHash = await walletClient.sendTransaction({
+        to: ENTRY_POINT,
+        data,
+        gas: fallbackGas,
+        value: 0n,
+        account,
+      });
+      console.log('Sent handleOps tx (raw):', txHash);
+    }
   } else {
     console.log('\n=== Final UserOperation (ready to send) ===');
     console.log(JSON.stringify(userOp, (k, v) => (typeof v === 'bigint' ? '0x' + v.toString(16) : v), 2));
