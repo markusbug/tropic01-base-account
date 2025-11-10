@@ -12,22 +12,7 @@
     "start": "node ./cbsw_p256_webauthn.js"
   },
   "dependencies": {
-    "viem": "^2.38.6"
-  }
-}
-
-{
-  "name": "test_p256",
-  "version": "1.0.0",
-  "description": "",
-  "license": "ISC",
-  "author": "",
-  "type": "module",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "dependencies": {
+    "dotenv": "^17.2.3",
     "viem": "^2.38.6"
   }
 }

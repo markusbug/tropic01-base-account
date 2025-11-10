@@ -26,7 +26,9 @@ const WEBAUTHN_AUTHDATA_SIGNCOUNT = false;
 // ---------- External signer integration (optional) ----------
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LTUTIL_BIN = process.env.LTUTIL_BIN || join(__dirname, 'libtropic-util', 'build', 'lt-util');
-const LTUTIL_DEVICE = process.env.LTUTIL_DEVICE || '/dev/ttyACM0';
+const LTUTIL_DEVICE = (typeof process.env.LTUTIL_SPI !== 'undefined')
+  ? ''
+  : (process.env.LTUTIL_DEVICE || '/dev/ttyACM0');
 let LTUTIL_SLOT = process.env.LTUTIL_SLOT || '1';
 const LTUTIL_USE_SUDO = (process.env.LTUTIL_USE_SUDO || '0') === '1';
 const AUTO_SEND = (process.env.SEND || process.env.AUTO_SEND || '0') === '1';
