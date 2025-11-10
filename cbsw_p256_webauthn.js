@@ -50,11 +50,15 @@ function execFilePromise(cmd, args) {
   });
 }
 
+function buildLtArgs(...rest) {
+  return (LTUTIL_DEVICE && LTUTIL_DEVICE.length > 0) ? [LTUTIL_DEVICE, ...rest] : rest;
+}
+
 async function autoSignWithLtUtil(messageHashHex) {
   ensureLtUtilExists();
   const tmp = mkdtempSync(join(tmpdir(), 'lt-sign-'));
   const out = join(tmp, 'sig_rs.bin');
-  const args = [LTUTIL_DEVICE, '-e', '-S', String(LTUTIL_SLOT), messageHashHex, out];
+  const args = buildLtArgs('-e', '-S', String(LTUTIL_SLOT), messageHashHex, out);
   try {
     if (LTUTIL_USE_SUDO) {
       await execFilePromise('/usr/bin/sudo', [LTUTIL_BIN, ...args]);
@@ -77,7 +81,7 @@ async function autoFetchPubkeyXY() {
   }
   const tmp = mkdtempSync(join(tmpdir(), 'lt-pub-'));
   const out = join(tmp, 'pubkey_slot.bin');
-  const args = [LTUTIL_DEVICE, '-e', '-d', String(LTUTIL_SLOT), out];
+  const args = buildLtArgs('-e', '-d', String(LTUTIL_SLOT), out);
   try {
     if (LTUTIL_USE_SUDO) {
       await execFilePromise('/usr/bin/sudo', [LTUTIL_BIN, ...args]);
@@ -115,7 +119,7 @@ function ensureLtUtilExists() {
 
 async function generateP256KeyInSlot(slotStr) {
   ensureLtUtilExists();
-  const args = [LTUTIL_DEVICE, '-e', '-g', String(slotStr), 'p256'];
+  const args = buildLtArgs('-e', '-g', String(slotStr), 'p256');
   try {
     console.log(`Generating P-256 key in slot ${slotStr}...`);
     if (LTUTIL_USE_SUDO) {
